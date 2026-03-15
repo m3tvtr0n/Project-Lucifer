@@ -36,6 +36,9 @@ Using BSSID byte-masking, the tool maps out hidden, guest, and 5GHz/2.4GHz sibli
 
 Modern iOS devices suppress directed probes, making legacy karma attacks obsolete. Lucifer uses hostapd-mana in "loud" mode to capture probes from noisy devices (macOS/Windows) and broadcast them as beacons. This turns active probers into "seeders," tricking silent, passive-scanning iOS devices into auto-connecting to saved networks they never actually probed for.
 
+5. Dynamic Transparent MitM Bridge
+
+Seamlessly transitions targets from a captive portal to full internet access using MAC-based iptables injection, automatically dismissing OS detection (CNA/NCSI) to maintain the illusion of a legitimate network.
 
 ---
 
@@ -52,8 +55,7 @@ vs. Airgeddon / Wifiphisher / Legacy Scripts
 - Zero-Interaction Goal: Legacy scripts often deploy an open clone of a WPA2 network and wait for the user to manually open their Wi-Fi settings and click the fake AP. Lucifer's goal is automatic association. By combining MANA pool broadcasting with persistent, PMF-aware network denial, it triggers native OS auto-connect routines.
 
 - Modern Supplicant Awareness: Legacy tools break when targets transition between 2.4/5GHz bands or mesh nodes. Lucifer's BSSID mapping and active client sensing prevent the target from escaping the dissociation wave.
-
-
+  
 ---
 
 🛠️ Prerequisites & Hardware Needs
@@ -65,7 +67,11 @@ To run this framework as intended, your environment requires:
 - OS: Kali Linux, Parrot OS, or a heavily modified Debian/Ubuntu setup (macOS via UTM/VM is fully supported with USB passthrough).
 
 - Hardware: 3x USB Wireless Adapters that support both Monitor Mode with Packet Injection and AP Mode (e.g., MediaTek MT7612U / Alfa AWUS036ACM).
+  
+- Power & Bus Management: To ensure stability, adapters should be distributed across multiple USB Host Controllers. It is highly recommended to use externally powered USB hubs to prevent voltage drops during high-intensity transmission or injection phases.
 
+- Operating Environment: For maximum reliability, this script should be run on a bare-metal Linux installation. Running this configuration via USB Passthrough in a Virtual Machine (VM) and bridged network has also been tested as reliable.
+  
 - Dependencies:
 	- hostapd-mana (Crucial: standard hostapd will not work)
 
