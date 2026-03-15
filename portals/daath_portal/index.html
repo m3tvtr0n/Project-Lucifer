@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Connected</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body, html {
+            height: 100%;
+            width: 100%;
+            background-color: #000;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .full-screen-img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: block;
+        }
+
+        .connect-btn {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: rgba(255, 255, 255, 0.15);
+            color: #ccc;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            padding: 10px 24px;
+            font-size: 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            z-index: 10;
+        }
+
+        .connect-btn:hover {
+            background: rgba(255, 255, 255, 0.25);
+            color: #fff;
+        }
+    </style>
+</head>
+<body>
+    <img src="skull.jpg" alt="Connected" class="full-screen-img">
+    <button class="connect-btn" onclick="bridge()">Accept & Connect</button>
+
+    <script>
+        function bridge() {
+        var btn = document.querySelector(".connect-btn");
+        btn.innerText = "Connecting...";
+        btn.style.opacity = "0.5";
+        fetch("/connect", { method: "POST" })
+        .then(function(resp) {
+        if (!resp.ok) throw new Error("Bridge failed");
+        btn.innerText = "Connected";
+        setTimeout(function() {
+        var form = document.createElement("form");
+        form.method = "POST";
+        form.action = "/connect";
+        document.body.appendChild(form);
+        form.submit();
+        }, 800);
+        })
+        .catch(function() {
+        btn.innerText = "Retry";
+        btn.style.opacity = "1";
+        });
+        }
+    </script>
+</body>
+</html>

