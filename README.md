@@ -3,7 +3,7 @@ Project Lucifer: Advanced 802.11 Association & Captive Portal Framework
 📖 Overview
 
 
-Project Lucifer is a research-grade Wi-Fi auditing and Evil Twin framework designed to study forced auto-association mechanics against modern operating systems (iOS 16+, macOS Ventura+, Windows 11).
+Project Lucifer is a research-grade Wi-Fi auditing and Evil Twin framework designed to study forced auto-association mechanics against modern operating systems (iOS 26+, macOS 26+, Windows 11).
 
 While legacy tools struggle against modern probe suppression and Protected Management Frames (PMF), Lucifer utilizes a synchronized, three-adapter architecture to execute a "pincer" attack. It combines adaptive dissociation (Deauth/CSA/Auth Flooding) with aggressive hostapd-mana karma beaconing to force target devices to seamlessly transition to a rogue captive portal without user interaction.
 
