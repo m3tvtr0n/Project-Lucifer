@@ -21,6 +21,7 @@ import mimetypes
 import os
 import subprocess
 import sys
+import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -143,6 +144,22 @@ class PortalHandler(BaseHTTPRequestHandler):
     upstream_iface = "eth0"
     upstream_dns = "8.8.8.8"
     allowed_macs = set()
+    _mac_lock = threading.Lock()
+
+    def _try_allow_client(self, client_ip):
+        """Thread-safe client allow with deduplication."""
+        mac = resolve_mac(client_ip)
+        if not mac:
+            return None
+
+        mac_lower = mac.lower()
+        with self._mac_lock:
+            if mac_lower in self.allowed_macs:
+                return mac_lower
+            if allow_client(mac, self.upstream_iface, self.upstream_dns):
+                self.allowed_macs.add(mac_lower)
+                return mac_lower
+        return None
 
     def do_GET(self):
         path = urlparse(self.path).path.lower()
@@ -150,6 +167,24 @@ class PortalHandler(BaseHTTPRequestHandler):
         # RFC 8908 Captive Portal API (JSON)
         if path == "/api/captive":
             self._handle_captive_api()
+            return
+
+        # Firefox captive portal check (Must precede Apple due to path overlap)
+        if (
+            path in FIREFOX_PROBE_PATHS
+            and "firefox" in self.headers.get("User-Agent", "").lower()
+        ):
+            self._log_probe("FIREFOX", path)
+            client_ip = self.client_address[0]
+            if self._try_allow_client(client_ip):
+                body = b"success\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self._redirect_to_portal()
             return
 
         # Apple CNA probes
@@ -172,12 +207,43 @@ class PortalHandler(BaseHTTPRequestHandler):
         # Windows NCSI probes
         if path in WINDOWS_PROBE_PATHS:
             self._log_probe("WINDOWS", path)
+            client_ip = self.client_address[0]
+            mac = resolve_mac(client_ip)
+            if mac and mac.lower() in self.allowed_macs:
+                if path == "/connecttest.txt":
+                    body = b"Microsoft Connect Test"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if path == "/ncsi.txt":
+                    body = b"Microsoft NCSI"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if path == "/redirect":
+                    self.send_response(200)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
             self._redirect_to_portal()
             return
 
         # Android connectivity probes
         if path in ANDROID_PROBE_PATHS:
             self._log_probe("ANDROID", path)
+            client_ip = self.client_address[0]
+            mac = resolve_mac(client_ip)
+            if mac and mac.lower() in self.allowed_macs:
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             self._redirect_to_portal()
             return
 
@@ -187,6 +253,16 @@ class PortalHandler(BaseHTTPRequestHandler):
             and "firefox" in self.headers.get("User-Agent", "").lower()
         ):
             self._log_probe("FIREFOX", path)
+            client_ip = self.client_address[0]
+            mac = resolve_mac(client_ip)
+            if mac and mac.lower() in self.allowed_macs:
+                body = b"success\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             self._redirect_to_portal()
             return
 
@@ -201,13 +277,8 @@ class PortalHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length", 0))
         raw_body = self.rfile.read(content_length)
-        post_path = urlparse(self.path).path
-
-        if post_path == "/connect":
-            self._handle_connect()
-            return
-
         body = raw_body.decode("utf-8", errors="replace")
+        post_path = urlparse(self.path).path
 
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         client_ip = self.client_address[0]
@@ -229,6 +300,14 @@ class PortalHandler(BaseHTTPRequestHandler):
         except IOError as e:
             print(f"{C_RED}[ERROR]{C_RESET} Failed to write creds: {e}")
 
+        if not self._try_allow_client(client_ip):
+            print(
+                f"{C_RED}[BRIDGE]{C_RESET} "
+                f"Could not resolve MAC for {client_ip}"
+            )
+            self._redirect_to_portal()
+            return
+
         # Respond with Apple success page to dismiss CNA.
         # On non-Apple clients this is harmless — they see a brief
         # "Success" page and the portal closes.
@@ -240,39 +319,10 @@ class PortalHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
-    def _handle_connect(self):
-        """Bridge a client through to upstream internet via iptables."""
-        client_ip = self.client_address[0]
-        mac = resolve_mac(client_ip)
-
-        if not mac:
-            print(
-                f"{C_RED}[BRIDGE]{C_RESET} "
-                f"Could not resolve MAC for {client_ip}"
-            )
-            self._redirect_to_portal()
-            return
-
-        mac_lower = mac.lower()
-        if mac_lower not in self.allowed_macs:
-            if allow_client(mac, self.upstream_iface, self.upstream_dns):
-                self.allowed_macs.add(mac_lower)
-            else:
-                self._redirect_to_portal()
-                return
-
-        content = APPLE_SUCCESS_BODY.encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html")
-        self.send_header("Content-Length", str(len(content)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(content)
-
     def _handle_captive_api(self):
         """RFC 8908 Captive Portal API — returns JSON indicating captive state."""
         payload = {
-            "captive": True,
+            "captive": is_captive,
             "user-portal-url": f"http://{self.portal_ip}/",
             "venue-info-url": f"http://{self.portal_ip}/",
         }
