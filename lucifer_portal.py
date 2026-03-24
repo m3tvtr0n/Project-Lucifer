@@ -247,25 +247,6 @@ class PortalHandler(BaseHTTPRequestHandler):
             self._redirect_to_portal()
             return
 
-        # Firefox captive portal check
-        if (
-            path in FIREFOX_PROBE_PATHS
-            and "firefox" in self.headers.get("User-Agent", "").lower()
-        ):
-            self._log_probe("FIREFOX", path)
-            client_ip = self.client_address[0]
-            mac = resolve_mac(client_ip)
-            if mac and mac.lower() in self.allowed_macs:
-                body = b"success\n"
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            self._redirect_to_portal()
-            return
-
         # WPAD proxy auto-config
         if path == "/wpad.dat":
             self._handle_wpad()
@@ -321,8 +302,12 @@ class PortalHandler(BaseHTTPRequestHandler):
 
     def _handle_captive_api(self):
         """RFC 8908 Captive Portal API — returns JSON indicating captive state."""
+        client_ip = self.client_address[0]
+        mac = resolve_mac(client_ip)
+        captive = True
+        if mac and mac.lower() in self.allowed_macs:
+            captive = False
         payload = {
-            "captive": is_captive,
             "user-portal-url": f"http://{self.portal_ip}/",
             "venue-info-url": f"http://{self.portal_ip}/",
         }
