@@ -123,7 +123,7 @@ Arch Linux / BlackArch:
 
 sudo pacman -S aircrack-ng dnsmasq xterm iw tcpdump wireshark-cli macchanger python-scapy
 
-# hostapd-mana and mdk4 available via BlackArch repo or AUR
+hostapd-mana and mdk4 available via BlackArch repo or AUR
 
 2. Python Dependencies
 
