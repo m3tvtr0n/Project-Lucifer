@@ -135,7 +135,7 @@ pip install -r requirements.txt
 ## 🚀 Quick Start
 	1	Connect your 3 compatible USB wireless adapters to the host.
 
-	1	Clone the repository and make the script executable:
+	2	Clone the repository and make the script executable:
 git clone https://github.com/yourusername/lucifer.git
 
 ```bash
@@ -144,18 +144,18 @@ cd lucifer
 ```bash
 chmod +x lucifer.sh
 ```
-	1	Run the framework as root (required for raw packet injection and network namespace manipulation):
+	3	Run the framework as root (required for raw packet injection and network namespace manipulation):
 	
 ```bash	
 sudo ./lucifer.sh
 ```
-	1	Follow the interactive prompts to configure the attack state machine:
+	4	Follow the interactive prompts to configure the attack state machine:
 
 	•	Interface Assignment: You will be asked to assign your three adapters to their respective roles (Target Monitor, Suppress Monitor, and Rogue AP).
 	•	Target Selection & Reconnaissance: The tool will launch a live scan. Let the script scan for a few minutes to ensure it finds and logs all active clients on the target Access Point. Press ENTER to stop the scan and enter the ID of your target network. Lucifer will automatically map its mesh nodes and siblings.
 	•	Client Tracking: You can choose to lock onto a specific target client (enabling adaptive, surgical channel tracking), or leave the attack open to all clients on the AP (using weighted channel-hopping to deny the entire ESS) by selecting 0.
 	•	Template Selection: Choose which HTML captive portal payload to deploy from the portals/ directory.
 	•	Security Mode:
-	◦	[1] OPEN: Deploys a standard unencrypted portal. Highly effective for capturing new connections, but relies on OS fallback mechanics.
-	◦	[2] WPA2: Requires you to input the target's known PSK. Forces seamless Layer 2 roaming and auto-association for devices that already have the network saved.
+	•	[1] OPEN: Deploys a standard unencrypted portal. Highly effective for capturing new connections, but relies on OS fallback mechanics.
+	•	[2] WPA2: Requires you to input the target's known PSK. Forces seamless Layer 2 roaming and auto-association for devices that already have the network saved.
 
