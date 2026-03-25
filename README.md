@@ -138,13 +138,17 @@ pip install -r requirements.txt
 	1	Clone the repository and make the script executable:
 git clone https://github.com/yourusername/lucifer.git
 
+```bash
 cd lucifer
-
+```
+```bash
 chmod +x lucifer.sh
-
+```
 	1	Run the framework as root (required for raw packet injection and network namespace manipulation):
+	
+```bash	
 sudo ./lucifer.sh
-
+```
 	1	Follow the interactive prompts to configure the attack state machine:
 
 	•	Interface Assignment: You will be asked to assign your three adapters to their respective roles (Target Monitor, Suppress Monitor, and Rogue AP).
