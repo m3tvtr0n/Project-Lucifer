@@ -131,6 +131,16 @@ def allow_client(mac, upstream_iface, upstream_dns):
         print(f"{C_RED}[ERROR]{C_RESET} iptables allow failed: {e}")
         return False
 
+def check_uplink(iface):
+    """Test if the upstream interface has a default route."""
+    try:
+        result = subprocess.run(
+            ["ip", "route", "show", "default", "dev", iface],
+            capture_output=True, text=True, timeout=5,
+        )
+        return bool(result.stdout.strip())
+    except (subprocess.SubprocessError, OSError):
+        return False
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
@@ -145,6 +155,7 @@ class PortalHandler(BaseHTTPRequestHandler):
     upstream_dns = "8.8.8.8"
     allowed_macs = set()
     _mac_lock = threading.Lock()
+    uplink_available = False
 
     def _try_allow_client(self, client_ip):
         """Thread-safe client allow with deduplication."""
@@ -156,7 +167,14 @@ class PortalHandler(BaseHTTPRequestHandler):
         with self._mac_lock:
             if mac_lower in self.allowed_macs:
                 return mac_lower
-            if allow_client(mac, self.upstream_iface, self.upstream_dns):
+            if self.uplink_available and allow_client(
+                mac, self.upstream_iface, self.upstream_dns
+            ):
+                self.allowed_macs.add(mac_lower)
+                return mac_lower
+            if not self.uplink_available:
+                # No upstream — mark as allowed so CNA dismisses,
+                # but skip iptables (nothing to bridge to)
                 self.allowed_macs.add(mac_lower)
                 return mac_lower
         return None
@@ -201,6 +219,7 @@ class PortalHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(content)
                 return
+
             self._redirect_to_portal()
             return
 
@@ -308,6 +327,7 @@ class PortalHandler(BaseHTTPRequestHandler):
         if mac and mac.lower() in self.allowed_macs:
             captive = False
         payload = {
+            "captive": captive,
             "user-portal-url": f"http://{self.portal_ip}/",
             "venue-info-url": f"http://{self.portal_ip}/",
         }
@@ -321,24 +341,40 @@ class PortalHandler(BaseHTTPRequestHandler):
 
     def _handle_wpad(self):
         """WPAD proxy auto-discovery for Windows."""
-        wpad_script = (
-            "function FindProxyForURL(url, host) {\n"
-            f'  return "PROXY {self.portal_ip}:80";\n'
-            "}\n"
-        ).encode()
+        client_ip = self.client_address[0]
+        mac = resolve_mac(client_ip)
+
+        if mac and mac.lower() in self.allowed_macs:
+            wpad_script = (
+                "function FindProxyForURL(url, host) {\n"
+                '  return "DIRECT";\n'
+                "}\n"
+            ).encode()
+        else:
+            wpad_script = (
+                "function FindProxyForURL(url, host) {\n"
+                f'  return "PROXY {self.portal_ip}:80";\n'
+                "}\n"
+            ).encode()
+
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ns-proxy-autoconfig")
         self.send_header("Content-Length", str(len(wpad_script)))
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header("Expires", "0")
         self.end_headers()
         self.wfile.write(wpad_script)
 
     def _redirect_to_portal(self):
         """302 redirect to portal root — triggers CNA/NCSI portal detection."""
+        body = b"<html><body>Redirecting...</body></html>"
         self.send_response(302)
         self.send_header("Location", f"http://{self.portal_ip}/")
-        self.send_header("Content-Length", "0")
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
+        self.wfile.write(body)
 
     def _serve_file(self, path):
         """Serve static files from the portal directory."""
@@ -469,12 +505,30 @@ def main():
         )
         sys.exit(1)
 
+    php_files = [
+        f for f in os.listdir(args.portal_dir)
+        if f.endswith(".php")
+    ]
+    for php_file in php_files:
+        php_path = os.path.join(args.portal_dir, php_file)
+        try:
+            with open(php_path, "r") as f:
+                content = f.read(4096)
+            if "<?php" in content:
+                print(
+                    f"{C_YELLOW}[!] {php_file} contains PHP code that "
+                    f"will be served as raw HTML{C_RESET}"
+                )
+        except IOError:
+            pass
+
     # Configure handler class variables
     PortalHandler.portal_dir = args.portal_dir
     PortalHandler.creds_log = args.creds_log
     PortalHandler.portal_ip = args.portal_ip
     PortalHandler.upstream_iface = args.upstream_iface
     PortalHandler.upstream_dns = args.upstream_dns
+    PortalHandler.uplink_available = check_uplink(args.upstream_iface)
 
     server = ThreadedHTTPServer((args.bind, args.port), PortalHandler)
 
@@ -485,6 +539,7 @@ def main():
     print(f"    Portal IP:   {args.portal_ip}")
     print(f"    Upstream:    {args.upstream_iface}")
     print(f"    DNS:         {args.upstream_dns}")
+    print(f"    Uplink:      {'ONLINE' if PortalHandler.uplink_available else 'OFFLINE (portal-only)'}")
     print(f"    Probe paths: Apple={len(APPLE_PROBE_PATHS)} "
           f"Windows={len(WINDOWS_PROBE_PATHS)} "
           f"Android={len(ANDROID_PROBE_PATHS)}")
