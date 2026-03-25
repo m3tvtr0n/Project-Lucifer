@@ -2,6 +2,9 @@
 
 Project Lucifer is a research-grade 802.11 adversary simulation and Rogue BSS framework designed to analyze forced client steering and seamless auto-association to captive portals against modern OS supplicants (iOS 26.3+, macOS 26.3+, Windows 11).
 
+> [!IMPORTANT]
+> **Authorization required.** This tool actively transmits RF packets and executes Layer 2 Wi-Fi manipulation (Deauth, Auth Flooding, CSA, NAV). Only operate this framework against equipment you own or have explicit written authorization to test.
+
 ## Table of Contents
 
 - [Overview](#overview)
