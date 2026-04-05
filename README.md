@@ -79,14 +79,15 @@ To run this framework as intended, your environment requires:
 	•	OS: Kali Linux, Parrot OS, or a heavily modified Debian/Ubuntu setup (macOS via UTM/VM is fully supported with USB passthrough).
 	•	Hardware: 3x USB Wireless Adapters that support both Monitor Mode with Packet Injection and AP Mode (e.g., MediaTek MT7612U / Alfa AWUS036ACM).
 	•	Dependencies:
-	    ◦	    hostapd-mana (Crucial: standard hostapd will not work)
-	    ◦	    mdk4 (For Auth Flooding / Multi-BSSID Deauth)
-	    ◦	    airodump-ng suite & macchanger
-	    ◦	    dnsmasq & python3 (with scapy for custom frame injection)
+	    •	    hostapd-mana (Crucial: standard hostapd will not work)
+	    •	    mdk4 (For Auth Flooding / Multi-BSSID Deauth)
+	    •	    airodump-ng suite & macchanger
+	    •	    dnsmasq & python3
+		•       scapy
 
 ## 📡 Interface Architecture
 
-The framework’s multi-channel synchronization has been heavily tested and validated using three Alfa AWUS036ACM (MT7612U) 802.11ac adapters. To prevent USB endpoint exhaustion and TX power sag, the radios were deployed across a dedicated powered USB hub with isolated host controllers (dedicated buses). Running three active transmitters on a shared, unpowered USB bus will cause kernel-level driver crashes or silent packet drops.
+The framework’s multi-channel synchronization has been heavily tested and validated using three Alfa AWUS036ACM (MT7612U) 802.11ac adapters. To prevent USB endpoint exhaustion and TX power sag, the radios were deployed across a dedicated powered USB hub with isolated host controllers (dedicated buses). Running three active transmitters on a shared, unpowered USB bus will cause kernel-level driver crashes or silent packet drops. Although this tool has been designed to work with a VM linux environment, this setuo does consolidate the adapters into a unified bus. Using a bare metal linux is more desirable 
 
 Lucifer requires you to assign three distinct roles to your physical adapters upon launch:
 
@@ -116,21 +117,24 @@ Depending on your distribution, install the required network and wireless tools:
 
 Kali Linux / Debian / Ubuntu:
 
+```bash
 sudo apt update
 
 sudo apt install -y aircrack-ng mdk4 dnsmasq xterm iw tcpdump tshark macchanger python3-scapy
+```
 
 (Note: hostapd-mana is pre-packaged in Kali Linux. On standard Ubuntu/Debian, you will need to build hostapd-mana from source or use a specialized repository).
 
 Arch Linux / BlackArch:
 
+```bash
 sudo pacman -S aircrack-ng dnsmasq xterm iw tcpdump wireshark-cli macchanger python-scapy
+```
 
 hostapd-mana and mdk4 available via BlackArch repo or AUR
 
-2. Python Dependencies
+2. Dependencies
 
-If your distribution did not include Scapy in the system package manager (e.g., python3-scapy), you can install it using a virtual environment:
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
